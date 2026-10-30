@@ -20,7 +20,7 @@ coverage, which is not specific to GRASP-P either. Upstream's files carry thin s
 | `src/git/mod.rs` | declares `version` |
 | `src/main.rs` | the `version` attribute of `Cli` and of its `Serve` variant, both `grasp_p::build_info::version()` (`Config` sets upstream's version on that subcommand, and a subcommand's own version wins over the propagated one) |
 | `src/http/mod.rs` | `HttpService.grasp_p`; widened CORS on OPTIONS; blob routes matched on the base-path-stripped path (`blossom::match_route`) just before NIP-11; one condition on the `/metrics` route, which a node with GRASP-P enabled does not serve (see below) |
-| `src/config.rs` | `NGIT_GRASP_P_*` settings and their validation, including the GRASP-08 exclusion and the dial checks (one call, `grasp_p::egress::validate_dial_settings`); two GRASP-P lines in the help text of upstream's `NGIT_EVENT_BLACKLIST` (see "Policy fingerprint v4 and the event blacklist"), four in that of upstream's `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS`, and a short GRASP-P paragraph at the end of that of upstream's `NGIT_SYNC_BOOTSTRAP_RELAY_URL`, `NGIT_USER_INDEX_RELAYS` and `NGIT_SYNC_PLUS_FALLBACK_RELAYS` (see "Egress on a node that also serves public repositories") |
+| `src/config.rs` | `NGIT_GRASP_P_*` settings and their validation, including the GRASP-08 exclusion, the dial checks (one call, `grasp_p::egress::validate_dial_settings`) and the checks of the minimum blob charge (one call, `grasp_p::quota::check_min_blob_charge`); two GRASP-P lines in the help text of upstream's `NGIT_EVENT_BLACKLIST` (see "Policy fingerprint v4 and the event blacklist"), four in that of upstream's `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS`, and a short GRASP-P paragraph at the end of that of upstream's `NGIT_SYNC_BOOTSTRAP_RELAY_URL`, `NGIT_USER_INDEX_RELAYS` and `NGIT_SYNC_PLUS_FALLBACK_RELAYS` (see "Egress on a node that also serves public repositories") |
 | `src/sync/mod.rs` | declares `grasp_p_sync` and `private_index`; `grasp_p` state field; GRASP-P filters added to `sync_generic_filters`, `sync_generic_history` and `complete_live_filters`, for a configured peer only (`grasp_p_filters_for`); `register_relay` builds each connection with the GRASP-P node's address check (`with_grasp_p_address_check`) and with duplicate forwarding on a configured peer's connection only (`with_duplicate_event_forwarding`), takes its outbound policy from `grasp_p_peer_policy` when that gives one, and refuses, in upstream's own refusal branch, an event-directed relay that `grasp_p_event_relay_allowed` refuses (a `ws://` relay on a GRASP-P node; see "Egress on a node that also serves public repositories"); `schedule_nip65_discovery` passes over a discovery source that rule refused when it picks the one new source to dial (`grasp_p_discovery_source_refused`, same section); timer spawn; previously-rejected skip; after-saved / after-rejected hooks in `process_event_static_inner`; configured peers kept in `check_disconnects`, counted as desired in `retry_disconnected_relays`, kept by `handle_disconnect` (`grasp_p_peer_needs`) and not muted by the naughty list in `schedule_connect_relay` (`grasp_p_naughty_mute_applies`); the source gate in `process_event_static_inner` (`grasp_p_gate`), directly after the id and signature check (see below); the GRASP-P ids counted as delivered in the negentropy completion check of `handle_eose` (`grasp_p_settled_ids`); see "Configured peers" below for these; the service handed to both `HistoryJob`s (`historic_sync_with_options`, `spawn_history_queries`); declares `live_swap_backfill`, and `sync_live` reads the live set and the clock before its minimum-churn swap and then backfills the groups the swap closed (see "A minimum-churn swap of live coverage is backfilled here" below) |
 | `src/sync/history.rs` | negentropy also skips known-rejected GRASP-P ids |
 | `src/sync/relay_connection.rs` | forwards SDK-deduplicated events, only on a connection built with that flag (a configured peer's), after checking their id and signature and skipping the SDK's second copy of a new event; the flag `grasp_p_node` and its builder, and one call of `grasp_p::mirror::vet_relay_dial` on it each in `connect` and `vet_nip11_target`, on the outbound policy's answer, which on a GRASP-P node also refuses a NAT64 or 6to4 address that wraps an internal one, and IPv6 outside `2000::/3` or inside `2001::/23` (see "Configured peers" and "Egress on a node that also serves public repositories"); `fetch_events` drops fetched events whose id or signature does not verify; the NIP-11 probe (`fetch_limit_hints`, `preflight_limit_hints`, and the helpers `vet_nip11_target`, `VettedAddresses`, `nip11_client`, `read_limited_body`, `fetch_nip11_document`) follows no redirect, uses no proxy, reads at most 256 KiB and, for an event-directed target, is vetted on every call and connects only to the vetted addresses (see below); the accessor `live_subscriptions`, each live group with its id, for the backfill after a minimum-churn swap |
@@ -29,7 +29,7 @@ coverage, which is not specific to GRASP-P either. Upstream's files carry thin s
 | `src/nostr/lifecycle/deletion/archival.rs` | `archive_and_delete_filter` leaves state roots and stream wraps in place on a GRASP-P node, and a registration unless the deleting path recorded its own author as the owner: the coordinate path and the vanish do, the `e` path and the cascade's unanchored state deletion (kind 30618 only) record none (`grasp_p::offboard::removal_exempt`, given the event and that owner; see "Who may delete" below) |
 | `src/metrics/mod.rs` | additive helpers (the `ngit_private_*` series and their recorders); the field `Metrics::relay_labels`, its builder `with_relay_labels`, and one statement in `render` between `REGISTRY.gather()` and the encoder, which rewrites the relay labels when the field is set (see below) |
 | `Cargo.toml` | direct dependencies `heed` (with its `serde` features), `parking_lot`, `uuid`, `url`, `secp256k1`; the `ngit-private-watchdog` binary target; for the TLS test, the dev-dependencies `openssl` and `tokio-rustls` |
-| `tests/common/relay.rs` | the `extra_env` option and the constructors `start_with_grasp_p`, `start_with_grasp_p_at_base_path`, `start_grasp_p_pair_node` and `start_grasp_p_pair_node_with_upstream_guard` (the pair node without `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS`), which all set `NGIT_GRASP_P_METRICS_BIND=127.0.0.1:0` ahead of `extra_env`; the two pair constructors also name their bootstrap peer in `NGIT_GRASP_P_SYNC_PEER_URLS` and, through `TestRelay::blob_peer_url`, in `NGIT_GRASP_P_MIRROR_PEER_URLS`; the accessors `grasp_p_metrics` and `grasp_p_metrics_address` |
+| `tests/common/relay.rs` | the `extra_env` option and the constructors `start_with_grasp_p`, `start_with_grasp_p_at_base_path`, `start_grasp_p_pair_node` and `start_grasp_p_pair_node_with_upstream_guard` (the pair node without `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS`), which all set `NGIT_GRASP_P_METRICS_BIND=127.0.0.1:0` and `NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES=0` ahead of `extra_env`; the two pair constructors also name their bootstrap peer in `NGIT_GRASP_P_SYNC_PEER_URLS` and, through `TestRelay::blob_peer_url`, in `NGIT_GRASP_P_MIRROR_PEER_URLS`; the accessors `grasp_p_metrics` and `grasp_p_metrics_address` |
 | `.env.example`, `docs/reference/configuration.md`, `nix/module.nix` | the `NGIT_GRASP_P_*` settings (the other three config sources), and a GRASP-P paragraph on each of upstream's `NGIT_EVENT_BLACKLIST`, `NGIT_SYNC_ALLOW_NON_GLOBAL_TARGETS`, `NGIT_SYNC_BOOTSTRAP_RELAY_URL`, `NGIT_USER_INDEX_RELAYS` and `NGIT_SYNC_PLUS_FALLBACK_RELAYS` in each, at the end of upstream's text (in `nix/module.nix` the bootstrap relay's one-line description became a block for it); in the configuration reference also one on upstream's `NGIT_DELETION_REQUEST_DISRESPECTOR`, at the end of its section |
 | `.gitignore`, `docs/how-to/prometheus-setup.md` | ignores for key files; a pointer to the GRASP-P alert rules and to the address a GRASP-P node is scraped on |
 
@@ -585,6 +585,83 @@ counter in `src/metrics/mod.rs`. `src/http/mod.rs` is not touched. Nothing joins
   Checking the bytes received against the rate as the body arrives would close it and
   is not done here. The bytes such uploads reserve are held for as long (see "The
   mirror is outside both caps").
+
+## The minimum blob charge
+
+Decision D5 (issue 25), in GRASP-P's own files: `src/grasp_p/quota.rs` (`billable`, and
+the boot checks in `check_min_blob_charge`), `src/grasp_p/claims.rs`, which prices every
+charge with it, `src/grasp_p/meta.rs` (the map size and the per-charge figure the boot
+check uses), the callers that hand the configuration to `claims.rs` (`state_root.rs`,
+`blob_store.rs`, the upload preflight in `mod.rs`, `gc.rs`), the mirror's reading of a
+declared size (`mirror.rs`), and the preimage and NIP-11 in `mod.rs`. In upstream's files:
+the setting and one call in `src/config.rs`, and one default in each GRASP-P constructor of
+`tests/common/relay.rs`.
+
+- **What was wrong.** A blob was charged its size, so a blob of a few bytes, or a state root
+  declaring 256 blobs of 0 bytes, cost almost nothing, while each claim costs a row in the
+  meta store and each stored blob an inode. An account could fill the node's meta map (4 GiB
+  then) with claims well inside its quota, and a full map fails every GRASP-P write on the
+  node.
+- **The rule.** `NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES` (default 16384; `0` = none): every charge,
+  for a declared blob and for a stored one, at the repository, account and node scopes, is
+  the size raised to the minimum (`quota::billable`). The byte quotas then bound how many
+  claims fit, at every scope, and no separate count exists. What is billed is separate from
+  what is stored: the claim's `size`, the file, `GET /list` and the upload descriptor keep
+  the real size. The event-bytes column is not touched.
+- **A charge records its price.** `ClaimCharge.bytes` is the billed amount and every release
+  gives back exactly that, so changing the minimum moves nothing by itself. A charge is
+  priced again only where `claims.rs` prices one: a repository that starts referencing the
+  blob or takes up again the grace charge it left (`attach`), the repository's newest
+  edition naming a blob not stored on the node (`redeclare`), and the bytes being stored or
+  found on the node, a repeated upload included (`settle_stored`). After a change of the
+  minimum the two nodes of a pair price their charges again at their own moments, so their
+  ledgers agree again only once each charge has been priced again on both. A raised minimum
+  can refuse what fitted before: a repository near its cap is refused for quota at its next
+  state root naming a blob not stored on the node, and its mirror fetches fail as quota. An
+  upload of a blob that other repositories also reference prices their charges too, and one
+  that cannot afford its new price stops referencing the blob (`detach_unaffordable`), as one
+  that declared too few bytes does; its next state root naming the blob is judged at the new
+  price.
+- **In the fingerprint.** The minimum decides which state roots and uploads fit near a cap,
+  so it is in the v4 preimage (`min_blob_charge=`). The label stays `grasp-p-policy-v4`: no
+  pair has run v4 (see "Policy fingerprint v4 and the event blacklist"). NIP-11 advertises it
+  as `private_repos.min_blob_charge_bytes`, and the startup line carries it.
+- **Boot checks.** The minimum may not exceed `NGIT_GRASP_P_QUOTA_REPO_BYTES`. The node
+  holds at most `NGIT_GRASP_P_GLOBAL_BUDGET_BYTES / minimum` charges, and the node refuses to
+  start when those at 12 KiB each (`META_BYTES_PER_CHARGE`) exceed the 48 GiB map
+  (`META_MAP_SIZE`, 4 GiB before this change): at 16 KiB the budget may be up to 64 GiB. A
+  minimum of 0 is allowed and warns. The map is sparse, so LMDB grows `data.mdb` only as it
+  writes. The 12 KiB is a bound, not the usual size: a client chooses the blob names a 30641
+  declares, in any order, and a name it drops is released at once, so pages cannot be taken
+  to fill as they do under random keys. A charge is a claim row with one charge (402 bytes
+  with LMDB's node header and page pointer) or a share of a larger one, and a per-repository
+  index entry (172). LMDB keeps at least one entry in a leaf (a split can leave a new leaf
+  with two, and a leaf a deletion leaves under a quarter full takes an entry from a neighbour,
+  which can leave that neighbour a single claim row when the rows differ in size; index
+  entries, all of one size, keep two) and at least two children in a branch page, so a tree
+  has fewer branch pages than leaves: less than two 4 KiB pages a charge in the claims and
+  less than one in the index. Under random keys a charge takes under 1 KiB, which
+  `meta::tests` measures over 10,000 of them. Not counted: the state ring, the registrations,
+  the ledger and LMDB's free list, which share the map, and kernels with memory pages larger
+  than 4 KiB, where LMDB's pages are larger too.
+- **The mirror.** Since merge request 16 the mirror read a repository's charge as its declared
+  size. A charge above the minimum still is one (as is, until the repository's next state root
+  naming the blob, a charge priced under an earlier, higher minimum, read as that minimum, so
+  the forecast can refuse near the cap a fetch `finish()` would take); a charge at the minimum
+  says only that the declaration was no larger, so the claim's (or the first route's) size,
+  capped at the minimum, stands in for it (`declared_size`). The quota forecast is the same
+  for every size up to the minimum; only a peer that announces no length reads by it, and
+  there the fetch fails on a length mismatch whenever the repository's own declaration was
+  not the claim's first size (or its charge was priced at an older, higher minimum), since a
+  charge at the minimum no longer records the declaration. The node's own GET always sends
+  the length.
+- **Tests.** The GRASP-P constructors of `tests/common/relay.rs` set the minimum to 0, and so
+  does `Config::for_testing`, so that the existing byte arithmetic holds; the tests of the
+  minimum set it (`claims::tests`, `quota::tests`, `meta::tests`, `state_root::tests`,
+  `blob_store::tests`, `mirror::tests`, the fingerprint and NIP-11 tests in `mod.rs`,
+  `exit48` in `tests/private_repos.rs` and `exit25` in `tests/private_two_node.rs`). In the
+  mirror the repair scan is tested at a minimum; the fetch's own reading of a fallback
+  route's charge is covered by the test of `declared_size` alone.
 
 ## The blob mirror: one queue per account, an attempt budget, every failure gated
 
@@ -2075,7 +2152,7 @@ sources.
   setting since v3, settled seats ("A settled seat is not displaced") and the deletion guard
   ("Who may delete"), so that a pair half on an older build reads as a version skew. No node
   runs v4 in a pair before the rest of M3 lands, so the knobs later M3 changes add join under
-  v4; M4 takes v5.
+  v4, as `min_blob_charge` did ("The minimum blob charge"); M4 takes v5.
 - **Startup.** The line `GRASP-P private repositories enabled` now carries `policy_version`,
   `sync_peers` (the peer set, sorted) where it printed the bootstrap relay as
   `configured_peer`, and `event_blacklist_keys` (how many keys the list refuses). A node with

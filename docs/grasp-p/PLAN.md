@@ -101,9 +101,26 @@ push; `git status` before every commit.
     blob, and the list and the upload descriptor report it.
   - `WWW-Authenticate: Nostr` on every 401 of the blob routes and on no other status.
 - **#25** per-tenant claim/file-count caps (decided on 2026-10-27: a minimum billable size,
-  no count; below); **#26** mirror fairness (**done**, below); **#20**
+  no count; **done**, below); **#26** mirror fairness (**done**, below); **#20**
   purgatory SSRF and **#3** DNS rebinding (both via `outbound.rs`; the mirror half of #3
   **done**, below); **#16** announcement-indexer pin + leak canary.
+  - **#25 done (merge request 17, decision D5).** Every stored or declared blob is charged
+    at least `NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES` (default 16 KiB, `0` = none) at the
+    repository, account and node scopes, so the byte quotas bound how many claims and files
+    each scope holds, and no count exists beside them. The disk, the claim and what the routes
+    report keep the real size. Each charge records what it was billed and is released by
+    exactly that, so a change of the minimum moves no charge by itself; a charge takes the new
+    minimum when it is next priced (a new reference or a grace charge taken up again, the
+    repository's newest declaration of a blob not stored on the node, the bytes stored or
+    uploaded again). The minimum is in the v4 preimage and NIP-11
+    (`private_repos.min_blob_charge_bytes`). The node refuses to start with a minimum above
+    the repository quota, or with a budget whose charges at that minimum would not fit the
+    meta map at 12 KiB each, the most a charge can take whatever order a client names its
+    blobs in (at 16 KiB, a budget of up to 64 GiB); the map grew from 4 GiB to 48 GiB for it,
+    sparse on disk (the maintainer accepted the larger map, 2026-10-29). See "The minimum blob charge" in [`SEAMS.md`](SEAMS.md). Still open: the
+    state ring shares the map uncounted, and the 12 KiB assumes 4 KiB memory pages; after a
+    change of the minimum the two nodes agree again only once each charge has been priced
+    again on both; and the cap on referrers per blob is merge request 20.
   - **#26 done.** The mirror keeps one queue per account and serves them in turn, an
     account holds at most half of the fetch slots, the worker never waits for a slot,
     every failure class backs off (none is retried by every scan any more),
@@ -240,10 +257,10 @@ project yet.
   removes the bytes; a reference made by an upload alone, which only the node that took the
   upload knows of until the repository's next state root, which may never come; and whether a
   repository that declared too few bytes could afford the stored size when it arrived. A claim
-  written in the old single-payer shape is refused rather than read. Still open: the minimum
-  billable size (#25, merge request 17); and, older than this change, a state root that
-  reaches a node after a newer one by the same write key is not retained there, so the references
-  the two nodes charge for can differ until enough newer editions have passed.
+  written in the old single-payer shape is refused rather than read. The minimum billable size
+  (#25) followed in merge request 17 (above). Still open, older than this change: a state root
+  that reaches a node after a newer one by the same write key is not retained there, so the
+  references the two nodes charge for can differ until enough newer editions have passed.
 - **Order of checks in registration** (done). Proofs of possession were verified before
   the key count was capped and before the admission mode was consulted, and the mode was
   consulted after the conflict merge, so an anonymous sender could cost CPU and raise the
@@ -527,7 +544,10 @@ the pair when a report's `server` tag is judged.
     store (bytes, repository count, paid-until). `quota::check` and the alias-limit check in
     `registration.rs` read it and fall back to the node default. The per-repository cap stops
     binding (repository limit = account limit). The repository-count limit stays as an
-    anti-spam bound, raised per plan, not removed.
+    anti-spam bound, raised per plan, not removed. The record needs no object count: every
+    blob is charged at least the minimum billable size (M3 #25), so a plan's bytes bound its
+    objects. Each plan states that minimum (16 KiB per blob at the default), as NIP-11
+    advertises it, and a usage display applies it, or its figure will not match the ledger.
   - **Server, set it without a restart.** The allowlist and the limits are read once at boot
     today. Add a local-only admin path, or a file re-read the way the denylist is. Both nodes of
     a pair must hold the same record, or one accepts a push the other refuses (the allowlist is
@@ -626,9 +646,9 @@ when the question was put.
   repositories alone, and both nodes of a pair compute the same ledger in any arrival order
   (with the exceptions the M3 entry above lists).
 - Small objects are billed at a minimum of 16 KiB per stored or declared blob, with no separate
-  count of objects (#25). The minimum is advertised in NIP-11 and stated wherever plans are
-  described. Objects are then bounded by bytes at every scope, and the per-account limit record
-  of M9 needs no object field.
+  count of objects (#25; done in M3, above). The minimum is advertised in NIP-11 and stated
+  wherever plans are described. Objects are then bounded by bytes at every scope, and the
+  per-account limit record of M9 needs no object field.
 - Only the account (hosting) key deletes anything from the server, and only a whole repository,
   through its registration (done in M3; above). Members cannot delete from the server: clients hide content through
   the encrypted stream, and the site says that the ciphertext stays until the repository is

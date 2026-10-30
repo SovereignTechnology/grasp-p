@@ -56,9 +56,11 @@ A response to `GET /<sha256>` or `HEAD /<sha256>` MUST NOT allow a cache to reus
 
 A service MAY limit how many uploads are in flight, per hosting pubkey and in total, and how long an upload body may take. A `PUT /upload` refused for such a limit MUST NOT be answered with the status used for exhausted storage (reference: `507`), since a client would read it as a full quota: SHOULD answer `429` when the limit is the hosting pubkey's own and `503` when it is the service's, each with `Retry-After`, and `408` for a body that stalls or exceeds its time (reference: 8 uploads per hosting pubkey, 64 per service, 30 seconds between two pieces of a body, and 30 seconds plus the declared length at 16384 bytes per second in total). Such a refusal MUST leave nothing stored and nothing charged. Fetches a service makes to replicate blobs from another service SHOULD NOT be counted against the limits its clients share. These limits are local to a service and two services that replicate each other need not agree on them.
 
+A service MAY charge every blob at least a minimum size against the storage it allows a repository and a hosting pubkey (reference: 16384 bytes), whether the blob is stored or only declared in a kind `30641` event, so that the storage allowance also bounds how many blobs fit in it. Such a service MUST still store, serve and describe each blob at its real size, and SHOULD advertise the minimum (see NIP-11). Two services that replicate each other MUST use the same minimum, since it decides which kind `30641` events and uploads fit.
+
 ## NIP-11
 
-MUST list this GRASP's number under `supported_grasps`, as GRASP-01 requires. SHOULD also advertise a top-level `private_repos` object carrying at least `kinds` (eg. `[30640, 30641, 3359, 23359]`), which MUST track the kinds actually admitted; other members are implementation-defined.
+MUST list this GRASP's number under `supported_grasps`, as GRASP-01 requires. SHOULD also advertise a top-level `private_repos` object carrying at least `kinds` (eg. `[30640, 30641, 3359, 23359]`), which MUST track the kinds actually admitted; a service that charges a minimum blob size (Blob Store) SHOULD carry it there as `min_blob_charge_bytes`, an integer number of bytes, so that a client can show usage as the service counts it; other members are implementation-defined.
 
 ## Rejection Messages
 

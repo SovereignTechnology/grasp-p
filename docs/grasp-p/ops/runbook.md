@@ -371,7 +371,7 @@ At startup, after the other GRASP-P checks:
 `grasp-p-policy-v4` preimage (`policy_preimage` in src/grasp_p/mod.rs):
 
 ```
-grasp-p-policy-v4|mode=…|pow_bits=…|whitelist=…|max_event_bytes=…|max_blob_bytes=…|quota_tenant=…|quota_repo=…|global_budget=…|max_aliases=…|max_keys=…|replace_capacity=…|replace_refill_per_hour=…|accept_legacy_wrap_kind=…|blacklist=…|deletion_request_disrespector=…|domains=…
+grasp-p-policy-v4|mode=…|pow_bits=…|whitelist=…|max_event_bytes=…|max_blob_bytes=…|quota_tenant=…|quota_repo=…|global_budget=…|min_blob_charge=…|max_aliases=…|max_keys=…|replace_capacity=…|replace_refill_per_hour=…|accept_legacy_wrap_kind=…|blacklist=…|deletion_request_disrespector=…|domains=…
 ```
 
 `domains` is this node's address (its domain, and its mount path under
@@ -405,6 +405,12 @@ registration frees neither its alias nor its keys, and the deleted
 registration sent again is taken, so with it on one node only a later
 registration that reuses them is accepted there and refused on the other.
 
+`min_blob_charge` is `NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES` (default 16384),
+the least any blob is charged (§3 [Ledger budget](#ledger-budget)). It
+decides which state roots and uploads fit near a cap, so two nodes on
+different values take and refuse different writes. It joined under the v4
+label, which no pair had run.
+
 `accept_legacy_wrap_kind` (`NGIT_GRASP_P_ACCEPT_LEGACY_WRAP_KIND`, default
 `true`) is in the preimage because it decides which stream-wrap KINDS the
 node admits: a peer with it off rejects a legacy kind-1059 stream wrap this
@@ -433,12 +439,13 @@ Deliberately ABSENT from the preimage (node-local knobs):
 **Where to see it.**
 
 - NIP-11: `private_repos.policy_fingerprint`, with the preimage label
-  alongside it in `private_repos.policy_version` and the accepted set in
-  `private_repos.kinds`
+  alongside it in `private_repos.policy_version`, the accepted set in
+  `private_repos.kinds` and the minimum blob charge in
+  `private_repos.min_blob_charge_bytes`
 - boot log: the `GRASP-P private repositories enabled` line carries the
   `mode`, `policy_fingerprint`, `policy_version`, `sync_peers` (the peer set
-  the domains come from) and `event_blacklist_keys` (how many keys the list
-  refuses) fields
+  the domains come from), `event_blacklist_keys` (how many keys the list
+  refuses) and `min_blob_charge_bytes` fields
 
 **Upgrade note.** Every label bump (v1→v2: the cadence knobs; v2→v3: the
 wrap kinds; v3→v4: the peer list and the blacklist) and the WP-E mode
@@ -916,6 +923,57 @@ D4), and the global gauge can be above what the blob store holds. Stored
 bytes nobody references any more stay charged to their last referrer, a
 repository that died included, until GC removes them.
 
+No charge is smaller than `NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES` (default
+16384, decision D5): a blob of 100 bytes, stored or only declared in a state
+root, costs 16 KiB at the repository, the account and the node. That is what
+bounds how many blobs fit: at most quota / minimum per repository and per
+account (32768 in a 512 MiB repository), and budget / minimum on the node
+(3,276,800 at 50 GiB). So it is also what to size the volumes by:
+
+- the blob volume needs at least `NGIT_GRASP_P_GLOBAL_BUDGET_BYTES /
+  NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES` free inodes (`df -i`), with room for
+  the temp files of uploads in flight;
+- the private meta store is a fixed 48 GiB map (4 GiB before the minimum
+  existed), and the node refuses to start when budget / minimum charges
+  would not fit it at 12 KiB each:
+
+  ```
+  NGIT_GRASP_P_GLOBAL_BUDGET_BYTES / NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES allows … blob charges, which need about … bytes of the private meta store at 12288 bytes each; it holds 51539607552. Raise NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES or lower NGIT_GRASP_P_GLOBAL_BUDGET_BYTES
+  ```
+
+  At 16 KiB the budget may be up to 64 GiB; a larger budget needs a larger
+  minimum (32 KiB for 128 GiB). The 12 KiB is the most a charge can take
+  whatever order a client names its blobs in; under the random names of
+  ordinary use a charge takes under 1 KiB. The map is sparse and the meta
+  data file (`data.mdb`) grows only as it is written, so it is the volume
+  that holds the file that must have room: about 1 KiB per charge in use,
+  and up to 12 KiB per charge the budget allows (37.5 GiB at the defaults)
+  against a client that shapes the store. The state ring shares the map
+  uncounted, so keep an eye on the size of `data.mdb` as the ledger fills.
+
+A minimum of `0` charges real sizes and warns at start; nothing then bounds
+the number of tiny blobs. A minimum above `NGIT_GRASP_P_QUOTA_REPO_BYTES`
+stops the node at start.
+
+Changing the minimum: set the same value on BOTH nodes and restart both
+(it is in the fingerprint, §2). Existing charges keep what they were
+billed and are released by exactly that, so the gauge does not move at the
+restart. A charge takes the new value only when it is next priced: when a
+repository starts referencing the blob, when the repository's newest state
+root declares a blob not stored on the node, or when the bytes are stored
+or uploaded again. Until then the two nodes can differ for the charges one
+has priced again and the other has not, and the boot check of the meta
+store, which counts charges at the minimum in force, does not bound the
+charges billed under a lower earlier minimum (or none): watch the size of
+`data.mdb` after raising it. Raising it can refuse what fitted
+before. A repository near its cap whose charge is priced at the new value
+is refused for quota at its next state root naming a blob not stored on
+the node, and its mirror fetches fail as quota. An upload of a blob that
+other repositories also reference prices their charges too, and a
+repository that cannot afford its new price stops referencing the blob, as
+one that declared too few bytes does; its next state root naming the blob
+is judged at the new price.
+
 Remediate:
 
 1. Verify GC is running: `journalctl -u ngit-grasp | grep 'private blob GC'`.
@@ -931,7 +989,9 @@ Remediate:
 3. Review quotas (`NGIT_GRASP_P_QUOTA_TENANT_BYTES` default 1 GiB,
    `NGIT_GRASP_P_QUOTA_REPO_BYTES` default 512 MiB) or raise the budget on
    BOTH nodes — the quota/budget knobs feed the fingerprint (§2) — and
-   update the alert literal in the rule file.
+   update the alert literal in the rule file. A budget above 64 GiB needs a
+   larger `NGIT_GRASP_P_MIN_BLOB_CHARGE_BYTES` (above), and the blob volume
+   its inodes.
 
 Known stranding: ledger bytes billed to a registration that died
 (merge-evicted / vanished / kind-5) are NOT fully reclaimed — the

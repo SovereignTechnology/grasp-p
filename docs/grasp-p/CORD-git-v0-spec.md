@@ -199,6 +199,19 @@ Addressable event signed by a **registered write key** (aux keys refused).
   an alias that declared too few bytes could afford them when they arrived, follow each node
   too. No alias's declaration sets what another alias pays or the size the mirror fetches for
   it.
+- **Minimum billable size [N]** (decision D5): no charge is smaller than the node's
+  `min_blob_charge_bytes` (NIP-11, §5; 16384 by default, `0` = none). A declared or stored blob
+  of fewer bytes is charged that much at each of the three scopes, so the byte quotas bound how
+  many blobs an alias, an account and the node hold, and there is no count beside them; a 30641
+  declaring 256 blobs of 0 bytes costs 256 minimums. What is billed is separate from what is
+  stored: the claim, the blob and every size the routes report stay the real size, and event
+  bytes are not affected. Each charge records what it was billed and is released by exactly
+  that; a charge takes a changed minimum only when it is next priced (an alias starts
+  referencing the blob or takes its grace charge up again, its newest retained edition declares
+  a blob not stored on the node, or the bytes are stored on the node, by an upload, a repeated
+  one included, or the mirror). The minimum is in `policy_fingerprint` (§5.1): two nodes on
+  different minimums refuse different 30641s and uploads near a cap. A client that shows usage
+  applies the advertised minimum, or its figure will not match the ledger.
 - **In-transaction identity re-check [N]**: liveness is read outside the meta write txn, so the txn
   re-verifies `(alias, tenant, latest event id)` before ANY mutation and rejects otherwise — a
   footprint born after a death would have no cleanup trigger left.
@@ -551,8 +564,9 @@ creates by the order alone (§2.1, "Settled seats").
 Also: write-key index with PoP, per-tenant/per-repo/global quota ledger + in-flight reservation,
 Blossom-subset blob store (streamed PUT, sha-verified, GC with grace), 30641 edition ring,
 aggregate metrics (no per-tenant labels), NIP-11 `private_repos` advert (`kinds`,
-`registration_mode`, size caps, quotas, `blob_endpoints`, `policy_fingerprint`, `policy_version`,
-plus `pow_bits` only in pow mode) — `src/grasp_p/mod.rs:1564-1601`. `policy_version` is the
+`registration_mode`, size caps, quotas, `min_blob_charge_bytes` (§2.2, the least a blob is
+charged), `blob_endpoints`, `policy_fingerprint`, `policy_version`, plus `pow_bits` only in pow
+mode) — `src/grasp_p/mod.rs:1564-1601`. `policy_version` is the
 `policy_fingerprint` PREIMAGE-FORMAT label published verbatim beside the digest, so a pair whose
 digests differ can tell a mid-rolling-upgrade version skew from a real same-version knob split
 (§5.1). The `kinds` array is the discovery signal for "does this node speak the private extension",
@@ -602,8 +616,9 @@ lookup of its own).
 - **`policy_fingerprint` v4**: `sha256(preimage)[..16]`, label `grasp-p-policy-v4`
   (`POLICY_VERSION`, `policy_preimage` in `src/grasp_p/mod.rs`), over
   `mode, pow_bits, whitelist, max_event_bytes, max_blob_bytes, quota_tenant, quota_repo,
-  global_budget, max_aliases, max_keys, replace_capacity, replace_refill_per_hour,
-  accept_legacy_wrap_kind, blacklist, deletion_request_disrespector, domains`
+  global_budget, min_blob_charge, max_aliases, max_keys, replace_capacity,
+  replace_refill_per_hour, accept_legacy_wrap_kind, blacklist, deletion_request_disrespector,
+  domains`
   (domains = the sorted set of the node's own service address and its configured sync peers,
   `NGIT_GRASP_P_SYNC_PEER_URLS` less the entries naming the node, each with the host in lower
   case, no default port (neither `:80` nor `:443`, whatever the scheme), no trailing slash and no
@@ -618,7 +633,9 @@ lookup of its own).
   The blacklist joined because a listed account's writes are refused on every path, synced events
   included (below). Upstream's `NGIT_DELETION_REQUEST_DISRESPECTOR` joined because it decides
   whether an honored deletion request frees a registration's alias and keys (§5.2): with it on one
-  node only, a later registration reusing them is accepted there and refused on the other. The
+  node only, a later registration reusing them is accepted there and refused on the other.
+  `min_blob_charge` (§2.2) joined because it sets what every blob costs, and so which 30641s and
+  uploads fit near a cap; it joined under the v4 label, which no pair had run. The
   label also marks two rules that changed acceptance with no knob since
   v3: settled seats (§2.1) and who may delete (§2.1, §5.2). Everything not named in that
   preimage is excluded; among the excluded knobs are client-write-rate, denylist, sync-re-issue
@@ -780,8 +797,9 @@ rather than re-registering and retrying once (client issue !34); widen is the wr
   edition that reaches a node after a newer one by the same write key is not retained there, so the two
   nodes' rings, and the references they charge for, can differ until enough newer editions
   have passed; a live squatter saturating their own quota
-  blocks a rekey at their claimed address until operator action; byte quotas do not bound
-  claim/file COUNTS (server issue !25).
+  blocks a rekey at their claimed address until operator action; claim and file counts are
+  bounded only through the minimum billable size (§2.2), and the node's boot check that the meta
+  store holds them counts 12 KiB per charge, LMDB's worst for 4 KiB pages, not the state ring.
 - **Landed since v0.1**: the **1059→3359 / 21059→23359 stream-wrap migration** (§2.3), on both the
   server (`c5301bb`) and the client (`eb1e5e2`), with the NIP-11 `kinds` advert, the sync filters and
   the `policy_fingerprint` moving in lockstep. What remains of it is not spec work but an operational
@@ -812,6 +830,7 @@ rather than re-registering and retrying once (client issue !34); widen is the wr
 - §2.4 — authorization window narrowed from ±24 h to one hour back and 15 minutes ahead; BUD-11 `server` tag (required for list); no used-id record, and why; response headers (`nosniff`, CSP, `no-cache` + `ETag` in place of a one-year `immutable`, `no-store` on errors, `WWW-Authenticate` on 401 only); `uploaded` is the stored time.
 - §2.4, §5.1 — upload answers listed; running out of upload slots answers `429` (per account) or `503` (node) with `Retry-After`, no longer `507`; an upload body that stalls or runs out of time is cut with `408`; the mirror takes no upload slot.
 - §5/§5.1 — NIP-11 gained `policy_version`; `policy_fingerprint` bumped to **v3** with `accept_legacy_wrap_kind` in the preimage.
+- §2.2, §5, §5.1 — minimum billable size (D5): every declared or stored blob is charged at least `min_blob_charge_bytes` (16 KiB by default) at every scope, the charge records what it was billed, the claim and the routes keep the real size; advertised in NIP-11 and in the v4 preimage as `min_blob_charge`.
 - §5.1, §5.2 — `policy_fingerprint` **v4**: the domains are the own address and the configured sync peers (no longer the bootstrap relay), the event blacklist joins as sorted hex keys, `NGIT_DELETION_REQUEST_DISRESPECTOR` joins, and the label also marks settled seats and who may delete; an account on the event blacklist is frozen (its write and aux keys' 30641s, wraps, 30640s and blob writes refused, from clients and sync, and its seats never displaced), its reads stay; new refusal strings, none containing `unregistered`.
 - §5.1, §5.2 — on a node that also serves public repositories, nothing of another kind may reference a 30640, 30641 or stream wrap (by coordinate, or by the id of a stored one), 10317s and the relay owner's events included; the kinds of §2 carry no reference tags beyond a 30641's own `a`, and never the audit hashtag; a kind 1984 that points at private-repository content is refused, logged and counted, and the blob key goes by direct mail only; new refusal strings, none containing `unregistered`.
 - §3 — derived stream/seal keys, prior-`#collab` key ring, precise HKDF shapes, the 900 s constant, id-pinned read-backs.

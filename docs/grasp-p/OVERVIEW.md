@@ -145,7 +145,9 @@ interrupted rotation resumes with the same bytes instead of minting a second, co
   a blob pays its full size, even when another account stored it, and a state root is charged
   for the blobs it declares before they are uploaded; the disk keeps one copy. A repository
   that stops referencing a blob is released at once while another references it; the last one
-  pays until GC deletes the bytes.
+  pays until GC deletes the bytes. No blob is charged less than a minimum (16 KiB by default,
+  advertised in NIP-11), so the byte budgets also bound how many blobs fit; the blob itself is
+  stored and reported at its real size.
 - **Rate limits**: per write key, and on how often a registration may be replaced.
 - **Abuse**: a denylist that answers 451 and purges, and intake of kind `1984` reports that
   point at a private repository: they are logged and counted for the operator, and refused,

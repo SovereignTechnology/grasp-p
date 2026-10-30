@@ -426,8 +426,9 @@ persist across restarts (`builder.rs:749-758,970`).
 `RelayInformationDocument.private_repos: Option<serde_json::Value>` (`src/http/nip11.rs:58-59`),
 populated from config at `nip11.rs:147` via `private::nip11_private_repos_from_config`
 (`src/grasp_p/mod.rs:1610-1622`), which emits `kinds`, `registration_mode`, `max_blob_bytes`,
-`max_event_bytes`, `quota_tenant_bytes`, `quota_repo_bytes`, `blob_endpoints`, `policy_fingerprint`,
-`policy_version`, and `pow_bits` when in PoW mode (`mod.rs:1564-1601`). Absent entirely when private
+`max_event_bytes`, `quota_tenant_bytes`, `quota_repo_bytes`, `min_blob_charge_bytes` (the least a
+blob is charged, decision D5), `blob_endpoints`, `policy_fingerprint`, `policy_version`, and
+`pow_bits` when in PoW mode (`mod.rs:1564-1601`). Absent entirely when private
 repos are disabled (`mod.rs:1611-1613`).
 
 **`policy_version` (value `grasp-p-policy-v4`, `POLICY_VERSION` in `src/grasp_p/mod.rs`) is new
@@ -444,9 +445,12 @@ so the two nodes of a pair, each listing the other, advertise one digest; and it
 `NGIT_EVENT_BLACKLIST`, which on a GRASP-P node refuse every write under a listed account's
 registrations as well as the account's own events (`src/grasp_p/blacklist.rs`), and upstream's
 `NGIT_DELETION_REQUEST_DISRESPECTOR`, which decides whether an honored deletion request frees a
-registration's alias and keys. The raw whitelist and blacklist are hashed, not advertised; a reader
-who can guess the other inputs can still test a guess of either list against the digest. Nothing in
-the advert's shape changed: the same two fields carry a different digest and label.
+registration's alias and keys, and the minimum blob charge (`min_blob_charge`), which decides which
+state roots and uploads fit near a cap. The raw whitelist and blacklist are hashed, not advertised;
+a reader who can guess the other inputs can still test a guess of either list against the digest.
+The fingerprint fields kept their shape: the same two fields carry a different digest and label.
+The advert gained one member beside them, `min_blob_charge_bytes`, a plain integer NIP-11 permits
+as it permits the others.
 
 **The advertised `kinds` array moved with item 12, and now cannot drift.** `mod.rs:1577-1579` builds
 it from the *same* helpers the admission arms and sync filters use
